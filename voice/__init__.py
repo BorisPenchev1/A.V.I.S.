@@ -1,0 +1,1 @@
+"""AVIS speech and hotkey package."""

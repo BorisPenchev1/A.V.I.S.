@@ -1,0 +1,34 @@
+.env.local
+.env.*
+!.env.example
+
+# Local runtime and logs
+audit.log
+*.log
+
+# Mirror server local config (contains access token) and live feed
+mirror_config.json
+mirror_activity.jsonl
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+
+# Editor / OS
+.DS_Store
+.vscode/
+
+# Swift / SwiftPM build artifacts
+macos/**/.build/
+macos/**/.swiftpm/
+.build/
+.swiftpm/
+
+# Generated or local data
+context/*.json
+!context/constant_context.json
+!context/long_term_context.json
+
+# Optional local test artifacts
+.coverage
+.pytest_cache/

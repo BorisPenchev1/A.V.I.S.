@@ -1,0 +1,7 @@
+mlx-whisper
+sounddevice
+soundfile
+pynput
+elevenlabs
+python-dotenv
+PySide6>=6.7.0
