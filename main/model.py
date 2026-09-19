@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import socket
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -19,14 +20,70 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL_NAME = os.getenv("QWEN_MODEL", "qwen3:8b")
 MAX_MESSAGES = 20
 MAX_PREDICT = int(os.getenv("AVIS_MAX_PREDICT", "1024"))
+# Bound the context window so Ollama allocates a small KV cache (less RAM).
+NUM_CTX = int(os.getenv("AVIS_NUM_CTX", "4096"))
+# A local 8B doing several web lookups can spend minutes generating; 120s was too
+# tight and surfaced as a bare "timed out". Configurable, with a clear message.
+CHAT_TIMEOUT = float(os.getenv("AVIS_OLLAMA_TIMEOUT", "300"))
+
+
+def _is_timeout(error: Exception) -> bool:
+    reason = getattr(error, "reason", error)
+    return isinstance(error, (TimeoutError, socket.timeout)) or isinstance(reason, (TimeoutError, socket.timeout))
+
+
+def _model_timeout_error(error: Exception) -> RuntimeError:
+    return RuntimeError(
+        f"The local model took longer than {int(CHAT_TIMEOUT)}s and was stopped. This "
+        "usually means the request needed several web lookups on an 8B model. Try a more "
+        "specific question, raise AVIS_OLLAMA_TIMEOUT, or set QWEN_MODEL to a smaller model."
+    )
+
+
+def _keep_alive() -> int | str:
+    """How long Ollama keeps the model resident after a request.
+
+    Defaults to "5m" so the ~6 GB model unloads when idle instead of being
+    pinned in RAM forever (keep_alive=-1), which is what caused the constant
+    memory pressure. Set AVIS_MODEL_KEEP_ALIVE to "0" to unload immediately
+    after every reply, "-1" to pin it, or any Ollama duration like "2m".
+    """
+    value = os.getenv("AVIS_MODEL_KEEP_ALIVE", "5m")
+    try:
+        return int(value)          # seconds, or -1 to pin, 0 to unload at once
+    except ValueError:
+        return value               # a duration string like "5m"
+
+
+def _options() -> dict[str, Any]:
+    return {"temperature": 0, "num_predict": MAX_PREDICT, "num_ctx": NUM_CTX}
 
 
 def _normalize_prompt(prompt: str) -> str:
     return re.sub(r"\s+", " ", prompt.strip().casefold())
 
 
+_WEB_INTENT = re.compile(
+    r"\b("
+    r"search|google|duckduckgo|look\s*up|browse|web\s*search|on\s+the\s+(?:web|internet)|online|"
+    r"news|headlines?|weather|forecast|temperature|"
+    r"stock|shares?|share\s+price|price|prices|cost|worth|exchange\s+rate|"
+    r"latest|newest|recent|current(?:ly)?|upcoming|today'?s|tonight|this\s+(?:week|weekend|month|season|year)|next\s+(?:week|weekend|month|season|game|match)|"
+    r"schedule|fixtures?|matches?|games?|standings?|results?|scores?|rankings?|leaderboard|"
+    r"release\s+date|released?|out\s+yet|"
+    r"who\s+(?:is|are|won|plays?|leads?)|when\s+(?:is|are|do|does|did|will|'?s)|where\s+(?:is|are|to)|"
+    r"how\s+(?:much|many|old|tall|far|long)|population|capital\s+of"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 def _query_mode(prompt: str) -> str:
     """Choose the cheapest response path that can satisfy the request."""
+    # Anything that needs the internet must run the tool-enabled agent path so
+    # web_search / web_fetch are available (plain chat streams without tools).
+    if re.search(r"https?://\S+", prompt, re.IGNORECASE) or _WEB_INTENT.search(prompt):
+        return "check"
     if re.search(r"\b(connect|disconnect|pause|play|toggle)\b", prompt, re.IGNORECASE):
         return "action"
     if re.search(
@@ -107,6 +164,10 @@ def _context_message(
         "content": (
             "You are AVIS, a local assistant. Use a tool when one directly matches "
             "the request. Never claim a tool ran unless its result says it did. "
+            "You can access the internet: call web_search for current, factual, or "
+            "online information. Prefer to answer from the search result snippets; only "
+            "call web_fetch when the snippets are not enough, and fetch at most one page. "
+            "Do not answer from memory when the user wants up-to-date or web information. "
             f"Today is {date.today().isoformat()}. Resolve relative dates using today. "
             "Current state: " + "; ".join(values) + "\n" + system_context(short_term or [])
         ),
@@ -118,9 +179,9 @@ def _chat(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = N
         "model": MODEL_NAME,
         "messages": messages,
         "stream": False,
-        "keep_alive": -1,
+        "keep_alive": _keep_alive(),
         "think": False,
-        "options": {"temperature": 0, "num_predict": MAX_PREDICT},
+        "options": _options(),
     }
     if tools:
         payload["tools"] = tools
@@ -131,12 +192,16 @@ def _chat(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = N
         method="POST",
     )
     try:
-        with urlopen(request, timeout=120) as response:
+        with urlopen(request, timeout=CHAT_TIMEOUT) as response:
             return json.load(response)
     except HTTPError as error:
         details = error.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Ollama returned HTTP {error.code}: {details}") from error
+    except (TimeoutError, socket.timeout) as error:
+        raise _model_timeout_error(error) from error
     except URLError as error:
+        if _is_timeout(error):
+            raise _model_timeout_error(error) from error
         raise RuntimeError(f"Could not connect to Ollama at {OLLAMA_URL}. Start Ollama and try again.") from error
 
 
@@ -146,9 +211,9 @@ def _stream_chat(messages: list[dict[str, Any]]) -> Iterator[str]:
         "model": MODEL_NAME,
         "messages": messages,
         "stream": True,
-        "keep_alive": -1,
+        "keep_alive": _keep_alive(),
         "think": False,
-        "options": {"temperature": 0, "num_predict": MAX_PREDICT},
+        "options": _options(),
     }
     request = Request(
         f"{OLLAMA_URL.rstrip('/')}/api/chat",
@@ -157,7 +222,7 @@ def _stream_chat(messages: list[dict[str, Any]]) -> Iterator[str]:
         method="POST",
     )
     try:
-        with urlopen(request, timeout=120) as response:
+        with urlopen(request, timeout=CHAT_TIMEOUT) as response:
             for line in response:
                 if not line.strip():
                     continue
@@ -170,7 +235,11 @@ def _stream_chat(messages: list[dict[str, Any]]) -> Iterator[str]:
     except HTTPError as error:
         details = error.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Ollama returned HTTP {error.code}: {details}") from error
+    except (TimeoutError, socket.timeout) as error:
+        raise _model_timeout_error(error) from error
     except URLError as error:
+        if _is_timeout(error):
+            raise _model_timeout_error(error) from error
         raise RuntimeError(f"Could not connect to Ollama at {OLLAMA_URL}. Start Ollama and try again.") from error
 
 
@@ -374,7 +443,24 @@ def _run_direct_tool(
     return result
 
 
-MAX_TOOL_STEPS = 5
+MAX_TOOL_STEPS = int(os.getenv("AVIS_MAX_TOOL_STEPS", "6"))
+# Cap web work per turn so the agent can't keep fetching pages (each fetch grows
+# the context the local model must reprocess, which is what made it crawl).
+MAX_WEB_SEARCH = int(os.getenv("AVIS_MAX_WEB_SEARCH", "3"))
+MAX_WEB_FETCH = int(os.getenv("AVIS_MAX_WEB_FETCH", "2"))
+
+
+_STALL = re.compile(
+    r"\b(let me|let'?s|i'?ll|i will|i'?m going to|i am going to|going to|allow me to)\b[^.]*?"
+    r"\b(fetch|look|check|search|find|retrieve|get|open|visit|read|browse|pull)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_stall(text: str) -> bool:
+    """True when the reply just promises to look something up instead of answering."""
+    stripped = text.strip()
+    return len(stripped) < 320 and bool(_STALL.search(stripped))
 
 
 def _replay(text: str, on_token: Callable[[str], None]) -> None:
@@ -388,10 +474,23 @@ def _execute_tool_call(
     call: dict[str, Any],
     request_permission: Callable[[str, dict[str, Any]], bool] | None,
     memory: ConversationMemory,
+    budget: dict[str, int] | None = None,
 ) -> None:
     """Run one Qwen-requested tool call and record its result in memory."""
     function = call.get("function", {})
     tool_name = function.get("name")
+    # Enforce a per-turn budget on the web tools: once used up, tell the model to
+    # answer with what it has instead of fetching yet another page.
+    if budget is not None and tool_name in budget:
+        if budget[tool_name] <= 0:
+            memory.add({
+                "role": "tool",
+                "content": (f"Budget for {tool_name} reached for this turn. Do not call it again; "
+                            "give your best final answer using the information already gathered."),
+                "tool_name": str(tool_name),
+            })
+            return
+        budget[tool_name] -= 1
     arguments = function.get("arguments", {})
     if isinstance(arguments, str):
         try:
@@ -452,6 +551,7 @@ def run_assistant(
         return response
 
     # Agentic loop: let Qwen call tools until it is ready to answer.
+    tool_budget = {"web_search": MAX_WEB_SEARCH, "web_fetch": MAX_WEB_FETCH}
     final_message: dict[str, Any] | None = None
     for _ in range(MAX_TOOL_STEPS):
         messages = [_context_message(memory.state, memory.messages), *memory.messages]
@@ -463,18 +563,40 @@ def run_assistant(
             break
         memory.add(message)
         for call in tool_calls:
-            _execute_tool_call(call, request_permission, memory)
+            _execute_tool_call(call, request_permission, memory, tool_budget)
+        # Once the fetch allowance is spent, stop looping and synthesize an answer
+        # from what was gathered instead of letting the model keep fetching pages.
+        if tool_budget["web_fetch"] <= 0:
+            break
 
     if final_message is None:
-        # Hit the step cap; ask Qwen to summarize the tool results it gathered.
+        # No tool-free answer yet (step cap or fetch budget spent): force one.
         messages = [
             _context_message(memory.state, memory.messages),
             *memory.messages,
-            {"role": "user", "content": "Give me a clear, final answer based on the tool results above."},
+            {"role": "user", "content": (
+                "Based only on the tool results above, give the final answer now. Do not call "
+                "any tool and do not say you will look it up — state the actual information you found."
+            )},
         ]
         final_message = _chat(messages).get("message", {})
 
     response = (final_message.get("content") or "").strip()
+    # Qwen sometimes narrates an intent ("Let me fetch the page…") instead of
+    # answering, ending the turn one step early. If the answer looks like that
+    # stall and we already gathered tool results, force a synthesis from them.
+    if _looks_like_stall(response) and any(m.get("role") == "tool" for m in memory.messages):
+        forced = _chat([
+            _context_message(memory.state, memory.messages),
+            *memory.messages,
+            {"role": "user", "content": (
+                "Based only on the tool results above, give the final answer now. Do not call any "
+                "tool and do not say you will look anything up — state the actual information found."
+            )},
+        ]).get("message", {})
+        forced_text = (forced.get("content") or "").strip()
+        if forced_text and not _looks_like_stall(forced_text):
+            response = forced_text
     if not response:
         response = "I ran the requested tools but could not compose a summary."
     memory.add({"role": "assistant", "content": response})

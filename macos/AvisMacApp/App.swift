@@ -141,6 +141,14 @@ enum SidebarPage: String, CaseIterable {
     case mirror = "Mirror"
 }
 
+/// What the voice pipeline is doing right now, surfaced in the chat composer.
+enum VoiceActivity: Equatable {
+    case idle          // nothing going on
+    case listening     // the microphone is capturing
+    case transcribing  // turning the recording into text
+    case speaking      // reading a reply aloud
+}
+
 // MARK: - View model
 
 @MainActor
@@ -158,13 +166,24 @@ final class AvisViewModel: ObservableObject {
     @Published var isSending = false
     @Published var automations: [Automation] = []
 
+    // Voice interaction
+    @Published var voiceActivity: VoiceActivity = .idle
+    @Published var isRecording = false        // push-to-talk capture in progress
+    @Published var conversationMode = false    // hands-free back-and-forth
+    @Published var voiceError: String?
+    private var recorder: VoiceProcess?        // mic capture subprocess
+    private var speaker: VoiceProcess?         // streaming speech playback subprocess
+
     // Mirror (iPhone) server + notifications
     @Published var mirrorRunning = false
     @Published var mirrorPort = 8765
     @Published var mirrorToken = ""
     @Published var mirrorNtfyServer = "https://ntfy.sh"
     @Published var mirrorNtfyTopic = ""
+    @Published var mirrorAllowTools = false
+    @Published var mirrorError: String?
     private var mirrorProcess: Process?
+    private var mirrorStopping = false
 
     // Context
     @Published var contextUser = ""
@@ -201,11 +220,18 @@ final class AvisViewModel: ObservableObject {
         loadContext()
         loadMirrorConfig()
         startScheduler()
+        // The mirror server is a child process; macOS does not reap it when this
+        // app quits. Terminate it on quit so it does not linger and hold the port,
+        // which would make the next "Start server" fail to bind.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stopMirror(); self?.stopAllVoice() }
+        }
     }
 
     // MARK: Chats
 
     func newChat() {
+        stopAllVoice()
         saveCurrentChat()
         currentChatID = UUID()
         grants = []
@@ -216,6 +242,7 @@ final class AvisViewModel: ObservableObject {
     }
 
     func openChat(_ chat: SavedChat) {
+        stopAllVoice()
         saveCurrentChat()
         currentChatID = chat.id
         grants = chat.grants
@@ -238,7 +265,7 @@ final class AvisViewModel: ObservableObject {
         persistChats()
     }
 
-    func sendPrompt() {
+    func sendPrompt(speakReply: Bool = false) {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isSending else { return }
         captureGrant(from: text)
@@ -249,6 +276,11 @@ final class AvisViewModel: ObservableObject {
         // Placeholder assistant message that streaming fills in gradually.
         let replyID = UUID()
         messages.append(ChatMessage(id: replyID, role: .assistant, text: ""))
+
+        // For a voice turn, start the streaming speaker now and feed it tokens
+        // as they arrive, so AVIS begins talking after the first chunk while the
+        // rest of the reply is still being generated and synthesized.
+        let speaker: VoiceProcess? = speakReply ? startStreamingSpeaker() : nil
 
         let history = Array(messages.dropLast(2)).map { ["role": $0.role.rawValue, "text": $0.text] }
         let request: [String: Any] = [
@@ -263,12 +295,14 @@ final class AvisViewModel: ObservableObject {
         runBridge(request: request,
                   onToken: { [weak self] token in
                       self?.appendToken(token, messageID: replyID)
+                      speaker?.write(token)
                   },
                   onFinal: { [weak self] full in
                       self?.setMessage(full, id: replyID)
+                      speaker?.write(full)   // non-streamed (tool) turns arrive whole
                   },
                   onDone: { [weak self] in
-                      self?.finishReply(id: replyID)
+                      self?.finishReply(id: replyID, speaker: speaker)
                   })
     }
 
@@ -304,12 +338,212 @@ final class AvisViewModel: ObservableObject {
         messages[index].text = text
     }
 
-    private func finishReply(id: UUID) {
+    private func finishReply(id: UUID, speaker: VoiceProcess?) {
         if let index = messages.firstIndex(where: { $0.id == id }), messages[index].text.isEmpty {
             messages[index].text = "The backend returned no response."
         }
         isSending = false
         saveCurrentChat()
+
+        // A voice turn keeps its streaming speaker: close its input so it speaks
+        // the tail and exits, which (in conversation mode) hands the turn back to
+        // the microphone. A non-voice turn just resumes listening if in a call.
+        if let speaker {
+            speaker.closeInput()
+        } else if conversationMode {
+            startConverseListen()
+        }
+    }
+
+    // MARK: Voice
+
+    /// The chat send button. A live recording is transcribed and sent (and its
+    /// reply spoken); otherwise whatever is typed is sent normally.
+    func handleSend() {
+        if isRecording {
+            stopRecordingAndSend()
+        } else {
+            sendPrompt()
+        }
+    }
+
+    /// Microphone button: start push-to-talk, or cancel a recording in progress.
+    func toggleMicrophone() {
+        guard !conversationMode else { return }
+        if isRecording {
+            cancelRecording()
+        } else {
+            startRecording()
+        }
+    }
+
+    private func startRecording() {
+        guard !isSending, recorder == nil, speaker == nil else { return }
+        voiceError = nil
+        voiceActivity = .listening
+        isRecording = true
+        let process = VoiceProcess()
+        recorder = process
+        process.start(projectRoot: projectRoot, arguments: ["listen-ptt"],
+                      onEvent: { [weak self] event in self?.handlePTTEvent(event) },
+                      onExit: { [weak self] in
+                          guard let self, self.recorder === process else { return }
+                          self.recorder = nil
+                      })
+    }
+
+    func cancelRecording() {
+        recorder?.terminate()
+        recorder = nil
+        isRecording = false
+        if voiceActivity == .listening { voiceActivity = .idle }
+    }
+
+    /// Send pressed while recording: finalize the capture; transcription then
+    /// fills the prompt and sends with the reply spoken.
+    private func stopRecordingAndSend() {
+        guard let process = recorder else {
+            isRecording = false
+            return
+        }
+        isRecording = false
+        voiceActivity = .transcribing
+        process.stopRecording()
+    }
+
+    private func handlePTTEvent(_ event: VoiceEvent) {
+        switch event {
+        case .listening:
+            if isRecording { voiceActivity = .listening }
+        case .text(let said):
+            let trimmed = said.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                voiceError = "I didn't catch anything — try again."
+                voiceActivity = .idle
+                return
+            }
+            prompt = trimmed
+            // If Send was already pressed we're transcribing: deliver and send.
+            // Otherwise the recording ended early — leave the text for the user.
+            if voiceActivity == .transcribing {
+                sendPrompt(speakReply: true)
+            } else {
+                isRecording = false
+                voiceActivity = .idle
+            }
+        case .silence:
+            voiceError = "I didn't catch anything — try again."
+            voiceActivity = .idle
+        case .error(let message):
+            voiceError = message
+            voiceActivity = .idle
+        case .spoke:
+            break
+        }
+    }
+
+    // MARK: Conversation mode
+
+    func toggleConversationMode() {
+        if conversationMode { exitConversationMode() } else { enterConversationMode() }
+    }
+
+    private func enterConversationMode() {
+        guard !isSending else { return }
+        cancelRecording()
+        voiceError = nil
+        conversationMode = true
+        startConverseListen()
+    }
+
+    func exitConversationMode() {
+        conversationMode = false
+        recorder?.terminate(); recorder = nil
+        speaker?.terminate(); speaker = nil
+        isRecording = false
+        voiceActivity = .idle
+    }
+
+    /// Listen for the next spoken turn. The recorder stops on its own once the
+    /// speaker pauses, so the user never signals "done".
+    private func startConverseListen() {
+        guard conversationMode, !isSending, recorder == nil, speaker == nil else { return }
+        voiceError = nil
+        voiceActivity = .listening
+        let process = VoiceProcess()
+        recorder = process
+        process.start(projectRoot: projectRoot, arguments: ["converse"],
+                      onEvent: { [weak self] event in self?.handleConverseEvent(event, process: process) },
+                      onExit: { [weak self] in
+                          guard let self, self.recorder === process else { return }
+                          self.recorder = nil
+                      })
+    }
+
+    private func handleConverseEvent(_ event: VoiceEvent, process: VoiceProcess) {
+        guard conversationMode else { return }
+        switch event {
+        case .listening:
+            voiceActivity = .listening
+        case .text(let said):
+            let trimmed = said.trimmingCharacters(in: .whitespacesAndNewlines)
+            if recorder === process { recorder = nil }
+            guard !trimmed.isEmpty else {
+                startConverseListen()
+                return
+            }
+            prompt = trimmed
+            sendPrompt(speakReply: true)   // reply is spoken, then we listen again
+        case .silence:
+            if recorder === process { recorder = nil }
+            startConverseListen()          // nothing heard yet; keep listening
+        case .error(let message):
+            voiceError = message
+            exitConversationMode()
+        case .spoke:
+            break
+        }
+    }
+
+    // MARK: Speech playback
+
+    /// Spawn the streaming speaker for a voice turn. Tokens are written to it as
+    /// they stream; `finishReply` closes its input when the reply is complete.
+    private func startStreamingSpeaker() -> VoiceProcess {
+        speaker?.terminate()
+        voiceActivity = .speaking
+        let process = VoiceProcess()
+        speaker = process
+        process.start(projectRoot: projectRoot, arguments: ["speak-stream"],
+                      onEvent: { [weak self] event in
+                          if case .error(let message) = event { self?.voiceError = message }
+                      },
+                      onExit: { [weak self] in self?.onSpeakingFinished(process) })
+        return process
+    }
+
+    private func onSpeakingFinished(_ process: VoiceProcess) {
+        guard speaker === process else { return }
+        speaker = nil
+        if conversationMode {
+            startConverseListen()
+        } else if voiceActivity == .speaking {
+            voiceActivity = .idle
+        }
+    }
+
+    func stopSpeaking() {
+        speaker?.terminate()
+        speaker = nil
+        if !conversationMode { voiceActivity = .idle }
+    }
+
+    private func stopAllVoice() {
+        conversationMode = false
+        recorder?.terminate(); recorder = nil
+        speaker?.terminate(); speaker = nil
+        isRecording = false
+        voiceActivity = .idle
     }
 
     // MARK: Tools
@@ -483,6 +717,7 @@ final class AvisViewModel: ObservableObject {
             mirrorToken = object["token"] as? String ?? ""
             mirrorNtfyServer = object["ntfy_server"] as? String ?? "https://ntfy.sh"
             mirrorNtfyTopic = object["ntfy_topic"] as? String ?? ""
+            mirrorAllowTools = object["allow_tools"] as? Bool ?? false
         }
         if mirrorToken.isEmpty {
             mirrorToken = UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(16).lowercased()
@@ -496,6 +731,7 @@ final class AvisViewModel: ObservableObject {
             "token": mirrorToken,
             "ntfy_server": mirrorNtfyServer,
             "ntfy_topic": mirrorNtfyTopic.trimmingCharacters(in: .whitespaces),
+            "allow_tools": mirrorAllowTools,
         ]
         if let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted]) {
             try? data.write(to: URL(fileURLWithPath: mirrorConfigPath), options: .atomic)
@@ -505,8 +741,12 @@ final class AvisViewModel: ObservableObject {
     func startMirror() {
         guard !mirrorRunning else { return }
         saveMirrorConfig()
+        mirrorError = nil
         let candidates = [projectRoot + "/.venv/bin/python", "/opt/homebrew/bin/python3", "/usr/bin/python3"]
-        guard let python = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return }
+        guard let python = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            mirrorError = "No Python interpreter found. Create the project .venv first."
+            return
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: python)
         process.arguments = ["-m", "server.mirror"]
@@ -515,10 +755,23 @@ final class AvisViewModel: ObservableObject {
         environment["PYTHONPATH"] = projectRoot
         environment["PYTHONUNBUFFERED"] = "1"
         process.environment = environment
-        process.terminationHandler = { [weak self] _ in
+
+        // Capture stderr so a startup failure (e.g. the port already in use) is
+        // surfaced to the user instead of the toggle silently flipping back.
+        let errPipe = Pipe()
+        process.standardError = errPipe
+
+        mirrorStopping = false
+        process.terminationHandler = { [weak self] proc in
+            let stderr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             Task { @MainActor in
-                self?.mirrorRunning = false
-                self?.mirrorProcess = nil
+                guard let self else { return }
+                self.mirrorRunning = false
+                self.mirrorProcess = nil
+                if !self.mirrorStopping && proc.terminationStatus != 0 {
+                    self.mirrorError = Self.describeMirrorFailure(status: proc.terminationStatus, stderr: stderr)
+                }
+                self.mirrorStopping = false
             }
         }
         do {
@@ -527,13 +780,23 @@ final class AvisViewModel: ObservableObject {
             mirrorRunning = true
         } catch {
             mirrorRunning = false
+            mirrorError = "Could not launch the server: \(error.localizedDescription)"
         }
     }
 
     func stopMirror() {
+        mirrorStopping = true
         mirrorProcess?.terminate()
         mirrorProcess = nil
         mirrorRunning = false
+    }
+
+    private static func describeMirrorFailure(status: Int32, stderr: String) -> String {
+        if stderr.contains("Address already in use") {
+            return "Port is already in use — a mirror server is still running (often left over after quitting without stopping it). Wait a moment and try again, or free the port, then start again."
+        }
+        let tail = String(stderr.trimmingCharacters(in: .whitespacesAndNewlines).suffix(300))
+        return tail.isEmpty ? "The server exited unexpectedly (code \(status))." : "The server stopped:\n\(tail)"
     }
 
     private func recordAutomationToMirror(name: String, body: String) {
@@ -771,6 +1034,110 @@ enum BridgeRunner {
     }
 }
 
+// MARK: - Voice bridge (mic capture + speech playback)
+
+enum VoiceEvent {
+    case listening
+    case text(String)
+    case silence
+    case spoke
+    case error(String)
+}
+
+/// A long-lived `python -m voice.bridge` subprocess. Unlike the one-shot chat
+/// bridge, the app keeps the handle so it can stop a recording (write to stdin),
+/// hand text over to be spoken, or interrupt playback (terminate).
+final class VoiceProcess {
+    private let process = Process()
+    private let inPipe = Pipe()
+    private let outPipe = Pipe()
+    private var buffer = Data()
+
+    func start(projectRoot: String,
+               arguments: [String],
+               onEvent: @escaping (VoiceEvent) -> Void,
+               onExit: @escaping () -> Void) {
+        let candidates = [
+            projectRoot + "/.venv/bin/python",
+            "/opt/homebrew/bin/python3",
+            "/usr/bin/python3",
+        ]
+        guard let python = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            onEvent(.error("No usable Python interpreter was found."))
+            onExit()
+            return
+        }
+        process.executableURL = URL(fileURLWithPath: python)
+        process.arguments = ["-m", "voice.bridge"] + arguments
+        process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONPATH"] = projectRoot
+        environment["PYTHONUNBUFFERED"] = "1"
+        process.environment = environment
+        process.standardInput = inPipe
+        process.standardOutput = outPipe
+        process.standardError = Pipe()   // swallow stderr; errors arrive as JSON lines
+
+        outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty, let self else { return }
+            self.buffer.append(chunk)
+            while let newline = self.buffer.firstIndex(of: 0x0A) {
+                let lineData = self.buffer.subdata(in: self.buffer.startIndex..<newline)
+                self.buffer.removeSubrange(self.buffer.startIndex...newline)
+                if let event = Self.parse(lineData) {
+                    DispatchQueue.main.async { onEvent(event) }
+                }
+            }
+        }
+        process.terminationHandler = { [weak self] _ in
+            self?.outPipe.fileHandleForReading.readabilityHandler = nil
+            DispatchQueue.main.async { onExit() }
+        }
+        do {
+            try process.run()
+        } catch {
+            onEvent(.error("Unable to start the voice bridge: \(error.localizedDescription)"))
+            onExit()
+        }
+    }
+
+    /// Feed text to the subprocess (the reply to speak). Pair with `closeInput()`.
+    func write(_ text: String) {
+        guard let data = text.data(using: .utf8) else { return }
+        try? inPipe.fileHandleForWriting.write(contentsOf: data)
+    }
+
+    func closeInput() {
+        try? inPipe.fileHandleForWriting.close()
+    }
+
+    /// Finalize a push-to-talk recording: any byte tells the recorder to stop.
+    func stopRecording() {
+        try? inPipe.fileHandleForWriting.write(contentsOf: Data([0x0A]))
+        try? inPipe.fileHandleForWriting.close()
+    }
+
+    func terminate() {
+        if process.isRunning { process.terminate() }
+    }
+
+    private static func parse(_ lineData: Data) -> VoiceEvent? {
+        guard !lineData.isEmpty,
+              let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+              let kind = object["t"] as? String else { return nil }
+        let text = object["x"] as? String ?? ""
+        switch kind {
+        case "listening": return .listening
+        case "text": return .text(text)
+        case "silence": return .silence
+        case "spoke": return .spoke
+        case "error": return .error(text)
+        default: return nil
+        }
+    }
+}
+
 // MARK: - Notifications
 
 /// A `swift run` executable has no bundle identifier, so UNUserNotificationCenter
@@ -983,20 +1350,53 @@ struct ChatPanelView: View {
                 }
             }
 
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("Ask AVIS anything...", text: $model.prompt, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 15))
-                    .lineLimit(1...6)
-                    .padding(.horizontal, 8)
-                    .frame(minHeight: 38)
-                    .onSubmit(model.sendPrompt)
-                Button { model.sendPrompt() } label: {
-                    if model.isSending { ProgressView().controlSize(.small) } else { Image(systemName: "arrow.up") }
+            VStack(spacing: 8) {
+                if model.conversationMode || model.voiceActivity != .idle || model.voiceError != nil {
+                    VoiceStatusBar()
                 }
-                .buttonStyle(.borderedProminent)
-                .frame(width: 38, height: 38)
-                .disabled(model.isSending)
+                HStack(alignment: .bottom, spacing: 8) {
+                    TextField("Ask AVIS anything...", text: $model.prompt, axis: .vertical)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 15))
+                        .lineLimit(1...6)
+                        .padding(.horizontal, 8)
+                        .frame(minHeight: 38)
+                        .onSubmit(model.handleSend)
+                        .disabled(model.conversationMode)
+
+                    // Conversation mode: hands-free back-and-forth.
+                    Button { model.toggleConversationMode() } label: {
+                        Image(systemName: "waveform")
+                            .frame(width: 38, height: 38)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(model.conversationMode ? Color.white : Color.secondary)
+                    .background(model.conversationMode ? Color.accentColor : Color.clear)
+                    .clipShape(Circle())
+                    .disabled(model.isSending && !model.conversationMode)
+                    .help("Conversation mode — talk back and forth with AVIS, hands-free")
+
+                    // Microphone: push-to-talk. Speak, then press send.
+                    Button { model.toggleMicrophone() } label: {
+                        Image(systemName: model.isRecording ? "mic.fill" : "mic")
+                            .frame(width: 38, height: 38)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(model.isRecording ? Color.white : Color.secondary)
+                    .background(model.isRecording ? Color.red : Color.clear)
+                    .clipShape(Circle())
+                    .disabled(model.conversationMode || model.isSending)
+                    .help("Speak, then press send to transcribe and send")
+
+                    Button { model.handleSend() } label: {
+                        if model.isSending { ProgressView().controlSize(.small) } else { Image(systemName: "arrow.up") }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .frame(width: 38, height: 38)
+                    .disabled(model.isSending || model.conversationMode)
+                }
             }
             .padding(6)
             .background(Color(nsColor: .textBackgroundColor))
@@ -1039,6 +1439,58 @@ struct ChatGPTMessageView: View {
             if message.role == .user { Spacer(minLength: 40) }
         }
         .padding(.vertical, 13)
+    }
+}
+
+/// Thin strip above the composer showing what voice is doing, with controls to
+/// stop speaking or leave conversation mode.
+struct VoiceStatusBar: View {
+    @EnvironmentObject private var model: AvisViewModel
+
+    private var icon: String {
+        if model.voiceError != nil { return "exclamationmark.triangle.fill" }
+        switch model.voiceActivity {
+        case .listening: return "waveform"
+        case .transcribing: return "hourglass"
+        case .speaking: return "speaker.wave.2.fill"
+        case .idle: return "waveform"
+        }
+    }
+
+    private var label: String {
+        if let error = model.voiceError { return error }
+        switch model.voiceActivity {
+        case .listening:
+            return model.conversationMode ? "Listening… just start talking" : "Listening… press send when you're done"
+        case .transcribing:
+            return "Transcribing…"
+        case .speaking:
+            return "AVIS is speaking…"
+        case .idle:
+            return model.conversationMode ? "Conversation mode on" : ""
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .foregroundStyle(model.voiceError != nil ? .orange : .blue)
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer()
+            if model.voiceActivity == .speaking {
+                Button("Stop") { model.stopSpeaking() }.controlSize(.small)
+            }
+            if model.conversationMode {
+                Button("End conversation") { model.exitConversationMode() }.controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.primary.opacity(0.05))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
 
@@ -1501,6 +1953,18 @@ struct MirrorPanelView: View {
                         }
                     }
 
+                    if let error = model.mirrorError {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            Text(error).font(.caption).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.orange.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+
                     if model.mirrorRunning {
                         HStack(alignment: .top, spacing: 20) {
                             if let qr = model.mirrorQRImage() {
@@ -1525,6 +1989,19 @@ struct MirrorPanelView: View {
                         Text("Start the server, then scan the QR code from your iPhone. Keep this Mac awake to stay connected.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+
+                    Divider()
+                    Toggle(isOn: Binding(
+                        get: { model.mirrorAllowTools },
+                        set: { model.mirrorAllowTools = $0; model.saveMirrorConfig() }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Let the phone run actions").font(.callout.weight(.medium))
+                            Text("When on, chats from the phone can execute tools (open apps, lock, volume, reminders…) without asking each time. When off, the phone is read-only unless you grant permission in the chat.")
+                                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.switch)
                 }
                 .padding(20)
                 .background(Color(nsColor: .windowBackgroundColor))

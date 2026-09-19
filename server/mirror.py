@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
     "token": "",
     "ntfy_server": "https://ntfy.sh",
     "ntfy_topic": "",
+    "allow_tools": False,   # when true, the phone may run actions without per-chat grants
 }
 
 
@@ -69,6 +70,14 @@ def save_config(config: dict[str, Any]) -> None:
         CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     except OSError:
         pass
+
+
+def tools_allowed() -> bool:
+    """Read the allow_tools flag live so the app's toggle applies without a restart."""
+    try:
+        return bool(json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("allow_tools"))
+    except (OSError, json.JSONDecodeError):
+        return bool(CONFIG.get("allow_tools"))
 
 
 def lan_ip() -> str:
@@ -280,11 +289,17 @@ class MirrorHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
-    def _begin_sse(self) -> None:
+    def _begin_sse(self, close: bool = False) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # A one-shot chat stream must close so the client sees end-of-stream and
+        # the socket is freed; the events feed stays open (persistent EventSource).
+        if close:
+            self.close_connection = True
+            self.send_header("Connection", "close")
+        else:
+            self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
@@ -348,8 +363,10 @@ class MirrorHandler(BaseHTTPRequestHandler):
 
         session = get_session(session_id)
         session.note_grant(prompt)
+        if tools_allowed():
+            session.grant_all = True
 
-        self._begin_sse()
+        self._begin_sse(close=True)
         try:
             def on_token(token: str) -> None:
                 self._sse({"t": "tok", "x": token})
@@ -529,8 +546,8 @@ async function send() {
     if (res.status === 401) { bubble.textContent = "Unauthorized — check the token."; return; }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = "", acc = "";
-    while (true) {
+    let buffer = "", acc = "", finished = false;
+    while (!finished) {
       const { value, done } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
@@ -541,11 +558,13 @@ async function send() {
         if (!line) continue;
         const evt = JSON.parse(line.slice(6));
         if (evt.t === "tok") { if (acc === "") bubble.textContent = ""; acc += evt.x; bubble.textContent = acc; }
-        else if (evt.t === "final" || (evt.t === "done" && acc === "")) { bubble.textContent = evt.x || acc; }
-        else if (evt.t === "err") { bubble.textContent = "Error: " + evt.x; }
+        else if (evt.t === "final") { bubble.textContent = evt.x || acc; finished = true; }
+        else if (evt.t === "done") { if (acc === "") bubble.textContent = evt.x || acc; finished = true; }
+        else if (evt.t === "err") { bubble.textContent = "Error: " + evt.x; finished = true; }
         document.getElementById("chatView").scrollTop = 1e9;
       }
     }
+    try { await reader.cancel(); } catch {}
     if (acc === "" && bubble.textContent === "…") bubble.textContent = "(no response)";
   } catch (e) {
     bubble.textContent = "Connection error: " + e.message;
@@ -594,6 +613,7 @@ def main() -> None:
     ip = lan_ip()
     print(f"AVIS Mirror running:  http://{ip}:{port}/?token={CONFIG['token']}")
     print(f"Token: {CONFIG['token']}")
+    print(f"Tool execution from phone: {'ALLOWED' if CONFIG.get('allow_tools') else 'off (read-only)'}")
     if CONFIG.get("ntfy_topic"):
         print(f"ntfy notifications -> {CONFIG.get('ntfy_server')}/{CONFIG['ntfy_topic']}")
     else:

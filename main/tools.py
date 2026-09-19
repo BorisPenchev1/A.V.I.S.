@@ -13,6 +13,7 @@ from typing import Any
 
 from security.security import PROJECT_ROOT
 from context.avis_context import add_long_term
+from main.web import web_search, web_fetch
 
 
 ALLOWED_APPS = frozenset(
@@ -416,9 +417,27 @@ def get_lock_status() -> str:
 
 
 def lock_device() -> str:
-    """Lock the Mac using the standard Control-Command-Q shortcut."""
+    """Lock the Mac. Prefers methods that need no Accessibility permission."""
     if platform.system() != "Darwin":
         raise RuntimeError("Locking the device is only supported on macOS.")
+
+    # 1. CGSession -suspend: a true lock, no Accessibility needed (older macOS).
+    cg_session = "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession"
+    if os.path.exists(cg_session):
+        result = subprocess.run([cg_session, "-suspend"], capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            return "Locked the Mac."
+
+    # 2. Sleep the display: no permission required. Locks immediately when
+    #    "Require password after sleep/screen saver" is set to immediately.
+    result = subprocess.run(["pmset", "displaysleepnow"], capture_output=True, text=True, check=False)
+    if result.returncode == 0:
+        return (
+            "Locked the Mac (display asleep). If it doesn't ask for a password on wake, "
+            "set System Settings > Lock Screen > 'Require password after…' to Immediately."
+        )
+
+    # 3. Last resort: the Ctrl-Cmd-Q keystroke, which needs Accessibility access.
     result = subprocess.run(
         ["osascript", "-e", 'tell application "System Events" to keystroke "q" using {control down, command down}'],
         capture_output=True,
@@ -426,7 +445,10 @@ def lock_device() -> str:
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "Could not lock the device. Enable Accessibility access for AVIS.")
+        raise RuntimeError(
+            "Could not lock the Mac. Grant Accessibility access to the app that runs AVIS "
+            "(System Settings > Privacy & Security > Accessibility), or set a password-on-sleep so display sleep locks."
+        )
     return "Lock command sent to the Mac."
 
 
@@ -569,6 +591,8 @@ TOOL_FUNCTIONS = {
     "read_calendar_for_date": read_calendar_for_date,
     "run_mac_diagnostics": run_mac_diagnostics,
     "remember_long_term": remember_long_term,
+    "web_search": web_search,
+    "web_fetch": web_fetch,
 }
 
 TOOLS: list[dict[str, Any]] = [
@@ -593,4 +617,6 @@ TOOLS: list[dict[str, Any]] = [
     {"type": "function", "function": {"name": "read_calendar_for_date", "description": "Read macOS Calendar events for a date. Use YYYY-MM-DD.", "parameters": {"type": "object", "required": ["date"], "properties": {"date": {"type": "string"}}}}},
     {"type": "function", "function": {"name": "run_mac_diagnostics", "description": "Run read-only Mac hardware, usage, performance, and security diagnostics after approval. Does not perform a malware scan.", "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "remember_long_term", "description": "Store a user-approved long-term note, optionally until YYYY-MM-DD.", "parameters": {"type": "object", "required": ["note"], "properties": {"note": {"type": "string"}, "until": {"type": "string"}}}}},
+    {"type": "function", "function": {"name": "web_search", "description": "Search the internet for current or factual information and return the top results as titles, URLs, and snippets. Use for anything about live data, recent events, or things not on this Mac.", "parameters": {"type": "object", "required": ["query"], "properties": {"query": {"type": "string"}, "max_results": {"type": "integer", "minimum": 1, "maximum": 10}}}}},
+    {"type": "function", "function": {"name": "web_fetch", "description": "Fetch a public http/https web page and return its readable text. Use it to open a result returned by web_search when you need the details on the page.", "parameters": {"type": "object", "required": ["url"], "properties": {"url": {"type": "string"}}}}},
 ]

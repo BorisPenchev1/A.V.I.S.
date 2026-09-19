@@ -31,6 +31,8 @@ PERMISSIONS = {
     "read_calendar_for_date": "ALLOW",
     "run_mac_diagnostics": "ASK",
     "remember_long_term": "ASK",
+    "web_search": "ALLOW",
+    "web_fetch": "ALLOW",
 }
 VERIFY_WITH_QWEN = frozenset({
     "open_app",
