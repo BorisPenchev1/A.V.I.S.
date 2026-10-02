@@ -9,9 +9,29 @@ struct AvisMacApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
                 .environmentObject(model)
                 .frame(minWidth: 1100, minHeight: 760)
+        }
+    }
+}
+
+/// Gates the app: sign-in first, then the admin dashboard for admins or the
+/// normal assistant workspace for everyone else.
+struct RootView: View {
+    @EnvironmentObject private var model: AvisViewModel
+
+    var body: some View {
+        Group {
+            if !model.isAuthenticated {
+                AuthView()
+            } else if model.needsPersonalization {
+                PersonalizationView()
+            } else if model.currentRole == "admin" {
+                AdminDashboardView()
+            } else {
+                ContentView()
+            }
         }
     }
 }
@@ -57,6 +77,61 @@ struct CustomTool: Identifiable, Codable {
     var id = UUID()
     var name: String
     var instruction: String
+}
+
+// MARK: - Accounts / admin models
+
+struct AccountRow: Identifiable, Sendable {
+    let id = UUID()
+    let username: String
+    var role: String
+    let created: String
+    let lastSeen: Double?
+}
+
+struct ActivityRow: Identifiable, Sendable {
+    let id = UUID()
+    let kind: String
+    let username: String
+    let source: String
+    let ts: Double
+    let tool: String?
+}
+
+struct AdminSummaryResult: Sendable {
+    var stats: [String: Int]
+    var users: [AccountRow]
+    var roles: [String]
+    var activity: [ActivityRow]
+    var security: [ActivityRow]
+}
+
+struct AuthResult: Sendable {
+    var ok: Bool
+    var user: String
+    var role: String
+    var error: String?
+    var newAccount: Bool = false
+}
+
+// MARK: - Account settings / profile models
+
+struct DeviceRow: Identifiable, Sendable {
+    let id = UUID()
+    let label: String
+    let source: String
+    let events: Int
+    let lastSeen: Double?
+}
+
+struct AccountProfile: Sendable {
+    var username: String
+    var role: String
+    var created: String
+    var lastSeen: Double?
+    var primaryDevice: String
+    var usage: [String: Int]
+    var devices: [DeviceRow]
 }
 
 enum ScheduleKind: String, Codable, CaseIterable {
@@ -139,6 +214,11 @@ enum SidebarPage: String, CaseIterable {
     case tools = "Tools"
     case automation = "Automation"
     case mirror = "Mirror"
+    case settings = "Settings"
+
+    /// Pages shown in the main sidebar list. Settings lives in the account
+    /// footer instead, so it is excluded here.
+    static var navigation: [SidebarPage] { [.chat, .context, .tools, .automation, .mirror] }
 }
 
 /// What the voice pipeline is doing right now, surfaced in the chat composer.
@@ -185,6 +265,25 @@ final class AvisViewModel: ObservableObject {
     private var mirrorProcess: Process?
     private var mirrorStopping = false
 
+    // Authentication / accounts
+    @Published var isAuthenticated = false
+    @Published var currentUser = ""
+    @Published var currentRole = ""
+    @Published var authBusy = false
+    @Published var authError: String?
+    @Published var needsPersonalization = false   // first-run onboarding after sign-up
+
+    // Account settings page
+    @Published var profile: AccountProfile?
+    @Published var profileLoading = false
+
+    // Admin dashboard
+    @Published var adminStats: [String: Int] = [:]
+    @Published var adminUsers: [AccountRow] = []
+    @Published var adminRoles: [String] = []
+    @Published var adminActivity: [ActivityRow] = []
+    @Published var adminSecurity: [ActivityRow] = []
+
     // Context
     @Published var contextUser = ""
     @Published var contextAssistant = "AVIS, a local assistant running on this Mac."
@@ -205,19 +304,32 @@ final class AvisViewModel: ObservableObject {
     ]
 
     private let projectRoot = "/Users/bobi/Documents/GitHub/A.V.I.S."
-    private var contextPath: String { projectRoot + "/context/constant_context.json" }
-    private let chatsKey = "avis.savedChats"
-    private let customToolsKey = "avis.customTools"
-    private let automationsKey = "avis.automations"
+
+    // Everything below is namespaced per signed-in account so each person has
+    // their own chats, tools, automations, and context — never a shared pool.
+    private var accountSlug: String {
+        let trimmed = currentUser.trimmingCharacters(in: .whitespaces).lowercased()
+        return trimmed.isEmpty ? "_shared" : trimmed
+    }
+    private var userContextDir: String { projectRoot + "/context/users/\(accountSlug)" }
+    private var contextPath: String { userContextDir + "/constant_context.json" }
+    private var longTermPath: String { userContextDir + "/long_term_context.json" }
+    private var chatsKey: String { "avis.savedChats.\(accountSlug)" }
+    private var customToolsKey: String { "avis.customTools.\(accountSlug)" }
+    private var automationsKey: String { "avis.automations.\(accountSlug)" }
+
+    /// Environment overrides so the Python backend reads *this* account's context
+    /// and long-term memory files instead of the shared project-level ones.
+    private func contextEnv() -> [String: String] {
+        ["AVIS_CONSTANT_CONTEXT": contextPath, "AVIS_LONG_TERM_CONTEXT": longTermPath]
+    }
 
     private var scheduler: Timer?
     private var runningAutomations: Set<UUID> = []
 
     init() {
-        loadChats()
-        loadCustomTools()
-        loadAutomations()
-        loadContext()
+        // Per-account data (chats, tools, automations, context) is loaded on
+        // sign-in via loadUserData(); the mirror server is Mac-wide, not per user.
         loadMirrorConfig()
         startScheduler()
         // The mirror server is a child process; macOS does not reap it when this
@@ -289,6 +401,8 @@ final class AvisViewModel: ObservableObject {
             "grants": grants,
             "grant_all": grantAll,
             "agent": pendingAgent,
+            "user": currentUser,
+            "role": currentRole,
         ]
         pendingAgent = false
 
@@ -384,7 +498,7 @@ final class AvisViewModel: ObservableObject {
         isRecording = true
         let process = VoiceProcess()
         recorder = process
-        process.start(projectRoot: projectRoot, arguments: ["listen-ptt"],
+        process.start(projectRoot: projectRoot, arguments: ["listen-ptt"], extraEnv: contextEnv(),
                       onEvent: { [weak self] event in self?.handlePTTEvent(event) },
                       onExit: { [weak self] in
                           guard let self, self.recorder === process else { return }
@@ -472,7 +586,7 @@ final class AvisViewModel: ObservableObject {
         voiceActivity = .listening
         let process = VoiceProcess()
         recorder = process
-        process.start(projectRoot: projectRoot, arguments: ["converse"],
+        process.start(projectRoot: projectRoot, arguments: ["converse"], extraEnv: contextEnv(),
                       onEvent: { [weak self] event in self?.handleConverseEvent(event, process: process) },
                       onExit: { [weak self] in
                           guard let self, self.recorder === process else { return }
@@ -607,6 +721,8 @@ final class AvisViewModel: ObservableObject {
             helpsWith: contextHelpsWith.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
         )
         do {
+            try FileManager.default.createDirectory(atPath: userContextDir,
+                                                     withIntermediateDirectories: true)
             let data = try JSONEncoder.pretty.encode(profile)
             try data.write(to: URL(fileURLWithPath: contextPath), options: .atomic)
             contextSaved = true
@@ -678,6 +794,8 @@ final class AvisViewModel: ObservableObject {
             "grants": [],
             "grant_all": true,
             "agent": automation.targetKind == .custom,
+            "user": currentUser,
+            "role": currentRole,
         ]
         var collected = ""
         runBridge(request: request,
@@ -883,7 +1001,7 @@ final class AvisViewModel: ObservableObject {
             onDone()
             return
         }
-        BridgeRunner.run(projectRoot: projectRoot, requestJSON: json) { event in
+        BridgeRunner.run(projectRoot: projectRoot, requestJSON: json, extraEnv: contextEnv()) { event in
             Task { @MainActor in
                 switch event {
                 case .token(let text): onToken(text)
@@ -896,6 +1014,39 @@ final class AvisViewModel: ObservableObject {
     }
 
     // MARK: Persistence
+
+    /// Load everything that belongs to the currently signed-in account.
+    private func loadUserData() {
+        savedChats = []
+        customTools = []
+        automations = []
+        loadChats()
+        loadCustomTools()
+        loadAutomations()
+        loadContext()
+        currentChatID = UUID()
+        grants = []
+        grantAll = false
+        messages = [ChatMessage(role: .assistant, text: "Hi \(currentUser). I can inspect your Mac, run safe tools, and help you stay in control.")]
+        page = .chat
+    }
+
+    /// Wipe in-memory account state on sign-out so the next person starts clean.
+    private func clearUserData() {
+        savedChats = []
+        customTools = []
+        automations = []
+        cancelEditingTool()
+        contextUser = ""
+        contextAssistant = "AVIS, a local assistant running on this Mac."
+        contextProjects = []
+        contextHelpsWith = "OS checks\nSafe Mac actions\nLocal automation\nVoice interaction"
+        profile = nil
+        messages = [ChatMessage(role: .assistant, text: "Signed out.")]
+        currentChatID = UUID()
+        grants = []
+        grantAll = false
+    }
 
     private func loadChats() {
         guard let data = UserDefaults.standard.data(forKey: chatsKey), let value = try? JSONDecoder().decode([SavedChat].self, from: data) else { return }
@@ -913,7 +1064,16 @@ final class AvisViewModel: ObservableObject {
     }
 
     private func loadContext() {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: contextPath)), let value = try? JSONDecoder().decode(ContextProfile.self, from: data) else { return }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: contextPath)),
+              let value = try? JSONDecoder().decode(ContextProfile.self, from: data) else {
+            // Fresh account with no saved context: start from clean defaults so
+            // one person's context never leaks into another's.
+            contextUser = ""
+            contextAssistant = "AVIS, a local assistant running on this Mac."
+            contextProjects = []
+            contextHelpsWith = "OS checks\nSafe Mac actions\nLocal automation\nVoice interaction"
+            return
+        }
         contextUser = value.user
         contextAssistant = value.assistant
         contextProjects = value.workingOn
@@ -949,6 +1109,116 @@ final class AvisViewModel: ObservableObject {
         savedChats = Array(savedChats.prefix(50))
         persistChats()
     }
+
+    // MARK: - Authentication & accounts
+
+    func authenticate(op: String, username: String, password: String) {
+        let name = username.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, !password.isEmpty else {
+            authError = "Enter a username and password."
+            return
+        }
+        authBusy = true
+        authError = nil
+        let root = projectRoot
+        Task {
+            let result = await Task.detached {
+                AuthBridge.auth(projectRoot: root, op: op, username: name, password: password)
+            }.value
+            authBusy = false
+            if result.ok {
+                currentUser = result.user
+                currentRole = result.role
+                loadUserData()   // load this account's own chats, tools, context
+                isAuthenticated = true
+                authError = nil
+                // A brand-new account gets a short personalization step before
+                // landing in the workspace. Admins skip straight to the dashboard.
+                needsPersonalization = result.newAccount && currentRole != "admin"
+                if currentRole == "admin" { loadAdminSummary() }
+            } else {
+                authError = result.error ?? "Something went wrong."
+            }
+        }
+    }
+
+    func logout() {
+        // Persist the active chat under the current account before tearing down.
+        stopAllVoice()
+        saveCurrentChat()
+        clearUserData()
+        isAuthenticated = false
+        needsPersonalization = false
+        currentUser = ""
+        currentRole = ""
+        authError = nil
+        adminStats = [:]
+        adminUsers = []
+        adminActivity = []
+        adminSecurity = []
+        page = .chat
+    }
+
+    /// Finish the first-run personalization step and enter the workspace.
+    func completePersonalization() {
+        saveContext()
+        needsPersonalization = false
+        page = .chat
+    }
+
+    func loadProfile() {
+        guard !currentUser.isEmpty else { return }
+        profileLoading = true
+        let root = projectRoot
+        let me = currentUser
+        Task {
+            let result = await Task.detached {
+                AuthBridge.profile(projectRoot: root, username: me)
+            }.value
+            profileLoading = false
+            if let result { profile = result }
+        }
+    }
+
+    func loadAdminSummary() {
+        guard currentRole == "admin" else { return }
+        let root = projectRoot
+        let me = currentUser
+        Task {
+            let summary = await Task.detached {
+                AuthBridge.summary(projectRoot: root, asUser: me)
+            }.value
+            if let summary {
+                adminStats = summary.stats
+                adminUsers = summary.users
+                adminRoles = summary.roles
+                adminActivity = summary.activity
+                adminSecurity = summary.security
+            }
+        }
+    }
+
+    func setRole(username: String, role: String) {
+        let root = projectRoot
+        let me = currentUser
+        Task {
+            _ = await Task.detached {
+                AuthBridge.setRole(projectRoot: root, asUser: me, username: username, role: role)
+            }.value
+            loadAdminSummary()
+        }
+    }
+
+    func deleteUser(username: String) {
+        let root = projectRoot
+        let me = currentUser
+        Task {
+            _ = await Task.detached {
+                AuthBridge.deleteUser(projectRoot: root, asUser: me, username: username)
+            }.value
+            loadAdminSummary()
+        }
+    }
 }
 
 // MARK: - Bridge runner (streams JSON-lines from the Python backend)
@@ -961,7 +1231,7 @@ enum BridgeEvent {
 }
 
 enum BridgeRunner {
-    static func run(projectRoot: String, requestJSON: String, emit: @escaping (BridgeEvent) -> Void) {
+    static func run(projectRoot: String, requestJSON: String, extraEnv: [String: String] = [:], emit: @escaping (BridgeEvent) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             let candidates = [
                 projectRoot + "/.venv/bin/python",
@@ -980,6 +1250,7 @@ enum BridgeRunner {
             var environment = ProcessInfo.processInfo.environment
             environment["PYTHONPATH"] = projectRoot
             environment["PYTHONUNBUFFERED"] = "1"
+            for (key, value) in extraEnv { environment[key] = value }
             process.environment = environment
 
             let outPipe = Pipe()
@@ -1034,6 +1305,128 @@ enum BridgeRunner {
     }
 }
 
+// MARK: - Auth bridge (one-shot identity / admin calls to the Python backend)
+
+enum AuthBridge {
+    /// Run `python -m main.auth_bridge '<json>'` and return the parsed object.
+    private static func runRaw(projectRoot: String, request: [String: Any]) -> [String: Any] {
+        let candidates = [
+            projectRoot + "/.venv/bin/python",
+            "/opt/homebrew/bin/python3",
+            "/usr/bin/python3",
+        ]
+        guard let python = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
+              let data = try? JSONSerialization.data(withJSONObject: request),
+              let json = String(data: data, encoding: .utf8) else {
+            return ["ok": false, "error": "No usable Python interpreter was found."]
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: python)
+        process.arguments = ["-m", "main.auth_bridge", json]
+        process.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONPATH"] = projectRoot
+        environment["PYTHONUNBUFFERED"] = "1"
+        process.environment = environment
+
+        let outPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+        } catch {
+            return ["ok": false, "error": "Unable to start the AVIS backend: \(error.localizedDescription)"]
+        }
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        // The bridge prints one JSON object; take the last non-empty line.
+        let lines = (String(data: outData, encoding: .utf8) ?? "")
+            .split(separator: "\n").map(String.init)
+        guard let last = lines.last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
+              let lineData = last.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
+            return ["ok": false, "error": "The backend returned no result."]
+        }
+        return object
+    }
+
+    static func auth(projectRoot: String, op: String, username: String, password: String) -> AuthResult {
+        let res = runRaw(projectRoot: projectRoot,
+                         request: ["op": op, "username": username, "password": password])
+        let ok = res["ok"] as? Bool ?? false
+        return AuthResult(ok: ok,
+                          user: res["user"] as? String ?? "",
+                          role: res["role"] as? String ?? "",
+                          error: res["error"] as? String,
+                          newAccount: res["new_account"] as? Bool ?? false)
+    }
+
+    static func profile(projectRoot: String, username: String) -> AccountProfile? {
+        let res = runRaw(projectRoot: projectRoot,
+                         request: ["op": "profile", "username": username, "as_user": username])
+        guard (res["ok"] as? Bool) == true, let account = res["account"] as? [String: Any] else { return nil }
+        var usage: [String: Int] = [:]
+        if let raw = res["usage"] as? [String: Any] {
+            for (key, value) in raw { usage[key] = (value as? NSNumber)?.intValue ?? 0 }
+        }
+        let devices = (res["devices"] as? [[String: Any]] ?? []).map { d in
+            DeviceRow(label: d["label"] as? String ?? "Device",
+                      source: d["source"] as? String ?? "",
+                      events: (d["events"] as? NSNumber)?.intValue ?? 0,
+                      lastSeen: (d["last_seen"] as? NSNumber)?.doubleValue)
+        }
+        return AccountProfile(
+            username: account["username"] as? String ?? username,
+            role: account["role"] as? String ?? "guest",
+            created: account["created"] as? String ?? "",
+            lastSeen: (account["last_seen"] as? NSNumber)?.doubleValue,
+            primaryDevice: account["primary_device"] as? String ?? "This Mac",
+            usage: usage,
+            devices: devices)
+    }
+
+    static func summary(projectRoot: String, asUser: String) -> AdminSummaryResult? {
+        let res = runRaw(projectRoot: projectRoot, request: ["op": "summary", "as_user": asUser])
+        guard (res["ok"] as? Bool) == true else { return nil }
+        var stats: [String: Int] = [:]
+        if let raw = res["stats"] as? [String: Any] {
+            for (key, value) in raw { stats[key] = (value as? NSNumber)?.intValue ?? 0 }
+        }
+        let users = (res["users"] as? [[String: Any]] ?? []).map { u in
+            AccountRow(username: u["username"] as? String ?? "?",
+                       role: u["role"] as? String ?? "guest",
+                       created: u["created"] as? String ?? "",
+                       lastSeen: (u["last_seen"] as? NSNumber)?.doubleValue)
+        }
+        let roles = res["roles"] as? [String] ?? []
+        func rows(_ key: String) -> [ActivityRow] {
+            (res[key] as? [[String: Any]] ?? []).map { e in
+                ActivityRow(kind: e["kind"] as? String ?? "",
+                            username: e["username"] as? String ?? "unknown",
+                            source: e["source"] as? String ?? "",
+                            ts: (e["ts"] as? NSNumber)?.doubleValue ?? 0,
+                            tool: (e["detail"] as? [String: Any])?["tool"] as? String)
+            }
+        }
+        return AdminSummaryResult(stats: stats, users: users, roles: roles,
+                                  activity: rows("activity"), security: rows("security"))
+    }
+
+    @discardableResult
+    static func setRole(projectRoot: String, asUser: String, username: String, role: String) -> Bool {
+        let res = runRaw(projectRoot: projectRoot,
+                         request: ["op": "set_role", "as_user": asUser, "username": username, "role": role])
+        return res["ok"] as? Bool ?? false
+    }
+
+    @discardableResult
+    static func deleteUser(projectRoot: String, asUser: String, username: String) -> Bool {
+        let res = runRaw(projectRoot: projectRoot,
+                         request: ["op": "delete_user", "as_user": asUser, "username": username])
+        return res["ok"] as? Bool ?? false
+    }
+}
+
 // MARK: - Voice bridge (mic capture + speech playback)
 
 enum VoiceEvent {
@@ -1055,6 +1448,7 @@ final class VoiceProcess {
 
     func start(projectRoot: String,
                arguments: [String],
+               extraEnv: [String: String] = [:],
                onEvent: @escaping (VoiceEvent) -> Void,
                onExit: @escaping () -> Void) {
         let candidates = [
@@ -1073,6 +1467,7 @@ final class VoiceProcess {
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONPATH"] = projectRoot
         environment["PYTHONUNBUFFERED"] = "1"
+        for (key, value) in extraEnv { environment[key] = value }
         process.environment = environment
         process.standardInput = inPipe
         process.standardOutput = outPipe
@@ -1181,6 +1576,316 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Authentication screen
+
+struct AuthView: View {
+    @EnvironmentObject private var model: AvisViewModel
+    @State private var isRegistering = false
+    @State private var username = ""
+    @State private var password = ""
+    @State private var confirm = ""
+
+    private var canSubmit: Bool {
+        !username.isEmpty && !password.isEmpty && (!isRegistering || password == confirm)
+    }
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.06, green: 0.10, blue: 0.21),
+                                    Color(red: 0.04, green: 0.06, blue: 0.13)],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                HStack(spacing: 10) {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(LinearGradient(colors: [.blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 40, height: 40)
+                        .overlay(Text("A").font(.system(size: 20, weight: .heavy)).foregroundStyle(.white))
+                    Text("AVIS").font(.system(size: 26, weight: .bold, design: .rounded)).tracking(2)
+                }
+                Text("Your home assistant")
+                    .font(.subheadline).foregroundStyle(.secondary)
+                    .padding(.top, 4).padding(.bottom, 22)
+
+                Picker("", selection: $isRegistering) {
+                    Text("Sign in").tag(false)
+                    Text("Create account").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 320)
+                .padding(.bottom, 18)
+                .onChange(of: isRegistering) { model.authError = nil }
+
+                VStack(spacing: 12) {
+                    field("Username", text: $username)
+                    secureField("Password", text: $password)
+                    if isRegistering {
+                        secureField("Confirm password", text: $confirm)
+                    }
+                }
+                .frame(maxWidth: 320)
+
+                Button(action: submit) {
+                    HStack {
+                        if model.authBusy { ProgressView().controlSize(.small) }
+                        Text(isRegistering ? "Create account" : "Sign in").fontWeight(.semibold)
+                    }
+                    .frame(maxWidth: 320)
+                    .padding(.vertical, 11)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canSubmit || model.authBusy)
+                .padding(.top, 14)
+
+                if let error = model.authError {
+                    Text(error).font(.callout).foregroundStyle(.red)
+                        .padding(.top, 12).frame(maxWidth: 320)
+                }
+            }
+            .padding(34)
+            .frame(width: 420)
+            .background(RoundedRectangle(cornerRadius: 20).fill(Color(red: 0.05, green: 0.08, blue: 0.16)))
+            .overlay(RoundedRectangle(cornerRadius: 20).stroke(Color.white.opacity(0.08)))
+            .shadow(color: .black.opacity(0.45), radius: 30, y: 18)
+        }
+    }
+
+    private func submit() {
+        model.authenticate(op: isRegistering ? "register" : "login", username: username, password: password)
+    }
+
+    @ViewBuilder private func field(_ label: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            TextField("", text: text)
+                .textFieldStyle(.plain).padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.06)))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.12)))
+                .onSubmit(submit)
+        }
+    }
+
+    @ViewBuilder private func secureField(_ label: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            SecureField("", text: text)
+                .textFieldStyle(.plain).padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.06)))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.12)))
+                .onSubmit(submit)
+        }
+    }
+}
+
+// MARK: - Admin dashboard
+
+struct AdminDashboardView: View {
+    @EnvironmentObject private var model: AvisViewModel
+
+    enum Section: String, CaseIterable { case overview = "Overview", users = "Users", security = "Security" }
+    @State private var section: Section = .overview
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            Picker("", selection: $section) {
+                ForEach(Section.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .padding(12)
+
+            ScrollView {
+                switch section {
+                case .overview: overview
+                case .users: usersSection
+                case .security: securitySection
+                }
+            }
+        }
+        .background(Color(red: 0.043, green: 0.063, blue: 0.125))
+        .onAppear { model.loadAdminSummary() }
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "shield.lefthalf.filled").foregroundStyle(.blue)
+            Text("AVIS").font(.system(size: 20, weight: .bold, design: .rounded))
+            Text("· Admin").foregroundStyle(.secondary)
+            Spacer()
+            Button("Refresh") { model.loadAdminSummary() }.buttonStyle(.bordered)
+            HStack(spacing: 6) {
+                Text(model.currentUser)
+                Text("ADMIN").font(.caption2.weight(.bold))
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Capsule().fill(Color.purple.opacity(0.25)))
+                    .foregroundStyle(Color.purple)
+            }
+            Button("Sign out") { model.logout() }.buttonStyle(.bordered)
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+    }
+
+    // ---- Overview ----
+    private var overview: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Usage")
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4), spacing: 10) {
+                stat("Accounts", model.adminStats["users"] ?? 0)
+                stat("Messages today", model.adminStats["messages_today"] ?? 0)
+                stat("Messages total", model.adminStats["messages_total"] ?? 0)
+                stat("Logins today", model.adminStats["logins_today"] ?? 0)
+                stat("Failed logins", model.adminStats["failed_logins_today"] ?? 0,
+                     tint: (model.adminStats["failed_logins_today"] ?? 0) > 0 ? .orange : nil)
+                stat("Denied actions", model.adminStats["denied_today"] ?? 0,
+                     tint: (model.adminStats["denied_today"] ?? 0) > 0 ? .red : nil)
+            }
+            sectionTitle("Recent activity")
+            card {
+                if model.adminActivity.isEmpty {
+                    empty("No activity yet.")
+                } else {
+                    ForEach(model.adminActivity) { row in
+                        activityRow(row, label: activityLabel(row))
+                        if row.id != model.adminActivity.last?.id { Divider() }
+                    }
+                }
+            }
+        }
+        .padding(16)
+    }
+
+    // ---- Users ----
+    private var usersSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Accounts")
+            card {
+                if model.adminUsers.isEmpty {
+                    empty("No accounts yet.")
+                } else {
+                    ForEach(model.adminUsers) { user in
+                        userRow(user)
+                        if user.id != model.adminUsers.last?.id { Divider() }
+                    }
+                }
+            }
+            Text("New sign-ups start as their default role. Promote them here.")
+                .font(.caption).foregroundStyle(.secondary).padding(.leading, 4)
+        }
+        .padding(16)
+    }
+
+    private func userRow(_ user: AccountRow) -> some View {
+        let isSelf = user.username == model.currentUser
+        return HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(user.username).fontWeight(.semibold)
+                Text(user.lastSeen != nil ? "seen \(relative(user.lastSeen!))" : "never signed in")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if isSelf {
+                Text("ADMIN").font(.caption2.weight(.bold))
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Capsule().fill(Color.purple.opacity(0.25))).foregroundStyle(Color.purple)
+                Text("(you)").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Picker("", selection: Binding(
+                    get: { user.role },
+                    set: { model.setRole(username: user.username, role: $0) }
+                )) {
+                    ForEach(model.adminRoles, id: \.self) { Text($0).tag($0) }
+                }
+                .labelsHidden().frame(width: 120)
+                Button(role: .destructive) { model.deleteUser(username: user.username) } label: {
+                    Text("Delete")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(.vertical, 8).padding(.horizontal, 12)
+    }
+
+    // ---- Security ----
+    private var securitySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionTitle("Security — failed logins & denied actions")
+            card {
+                if model.adminSecurity.isEmpty {
+                    empty("Nothing flagged. All quiet.")
+                } else {
+                    ForEach(model.adminSecurity) { row in
+                        activityRow(row, label: securityLabel(row), alert: true)
+                        if row.id != model.adminSecurity.last?.id { Divider() }
+                    }
+                }
+            }
+        }
+        .padding(16)
+    }
+
+    // ---- Shared building blocks ----
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text.uppercased()).font(.caption2.weight(.semibold)).tracking(1)
+            .foregroundStyle(.secondary).padding(.top, 10).padding(.leading, 4)
+    }
+
+    private func stat(_ label: String, _ value: Int, tint: Color? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("\(value)").font(.system(size: 26, weight: .bold)).foregroundStyle(tint ?? .primary)
+            Text(label).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.04)))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.08)))
+    }
+
+    private func card<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        VStack(spacing: 0) { content() }
+            .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.04)))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.08)))
+    }
+
+    private func activityRow(_ row: ActivityRow, label: String, alert: Bool = false) -> some View {
+        HStack(spacing: 8) {
+            Text(row.username).fontWeight(.semibold)
+            Text(label).foregroundStyle(alert ? Color.red.opacity(0.9) : .secondary)
+            Spacer()
+            Text(relative(row.ts)).font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 9).padding(.horizontal, 12)
+    }
+
+    private func empty(_ text: String) -> some View {
+        Text(text).foregroundStyle(.secondary).font(.callout)
+            .frame(maxWidth: .infinity).padding(16)
+    }
+
+    private func activityLabel(_ row: ActivityRow) -> String {
+        switch row.kind {
+        case "message": return "sent a message"
+        case "login": return "signed in"
+        case "register": return "created an account"
+        default: return row.kind
+        }
+    }
+
+    private func securityLabel(_ row: ActivityRow) -> String {
+        if row.kind == "login_failed" { return "failed login" + (row.source.isEmpty ? "" : " · \(row.source)") }
+        return "denied " + (row.tool ?? "action") + (row.source.isEmpty ? "" : " · \(row.source)")
+    }
+
+    private func relative(_ ts: Double) -> String {
+        let seconds = max(0, Date().timeIntervalSince1970 - ts)
+        if seconds < 60 { return "\(Int(seconds))s ago" }
+        if seconds < 3600 { return "\(Int(seconds / 60))m ago" }
+        if seconds < 86400 { return "\(Int(seconds / 3600))h ago" }
+        return "\(Int(seconds / 86400))d ago"
+    }
+}
+
 struct SidebarView: View {
     @EnvironmentObject private var model: AvisViewModel
     @State private var renamingChat: SavedChat?
@@ -1193,6 +1898,7 @@ struct SidebarView: View {
         case .tools: return "wrench.and.screwdriver.fill"
         case .automation: return "clock.arrow.circlepath"
         case .mirror: return "iphone.gen3"
+        case .settings: return "gearshape.fill"
         }
     }
 
@@ -1216,7 +1922,7 @@ struct SidebarView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .padding(.horizontal, 10)
 
-            ForEach(SidebarPage.allCases, id: \.self) { page in
+            ForEach(SidebarPage.navigation, id: \.self) { page in
                 Button { model.page = page } label: {
                     Label(page.rawValue, systemImage: icon(for: page))
                         .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
@@ -1263,8 +1969,10 @@ struct SidebarView: View {
                     }
                 }
             }
+
+            AccountFooter()
         }
-        .frame(width: 230)
+        .frame(width: 240)
         .background(Color(nsColor: .windowBackgroundColor))
         .sheet(item: $renamingChat) { chat in
             RenameSheet(title: $renameText) { newTitle in
@@ -1274,6 +1982,344 @@ struct SidebarView: View {
                 renamingChat = nil
             }
         }
+    }
+}
+
+// MARK: - Account footer (sidebar) + role badge
+
+/// Small helpers shared across account UI.
+enum AccountStyle {
+    static func initials(_ name: String) -> String {
+        String(name.trimmingCharacters(in: .whitespaces).prefix(1)).uppercased()
+    }
+
+    static func color(for role: String) -> Color {
+        switch role {
+        case "admin": return .purple
+        case "owner": return .blue
+        case "adult": return .teal
+        case "teen": return .green
+        case "child": return .orange
+        default: return .gray
+        }
+    }
+}
+
+struct RoleBadge: View {
+    let role: String
+    var body: some View {
+        Text(role.uppercased())
+            .font(.caption2.weight(.bold))
+            .padding(.horizontal, 7).padding(.vertical, 2)
+            .background(Capsule().fill(AccountStyle.color(for: role).opacity(0.22)))
+            .foregroundStyle(AccountStyle.color(for: role))
+    }
+}
+
+/// Pinned to the bottom of the sidebar: who is signed in, plus Settings and the
+/// Sign out control (previously missing for non-admin accounts).
+struct AccountFooter: View {
+    @EnvironmentObject private var model: AvisViewModel
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Divider()
+            Button { model.page = .settings } label: {
+                HStack(spacing: 10) {
+                    Circle()
+                        .fill(LinearGradient(colors: [AccountStyle.color(for: model.currentRole),
+                                                      AccountStyle.color(for: model.currentRole).opacity(0.6)],
+                                             startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 32, height: 32)
+                        .overlay(Text(AccountStyle.initials(model.currentUser))
+                            .font(.system(size: 14, weight: .bold)).foregroundStyle(.white))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.currentUser).font(.callout.weight(.semibold)).lineLimit(1)
+                        RoleBadge(role: model.currentRole)
+                    }
+                    Spacer()
+                    Image(systemName: "gearshape.fill").foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .background(model.page == .settings ? Color.accentColor.opacity(0.18) : .clear)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .padding(.horizontal, 10)
+
+            Button { model.logout() } label: {
+                Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .padding(.bottom, 10)
+        }
+    }
+}
+
+// MARK: - Personalization (first-run onboarding)
+
+/// Shown once, right after a new account is created, so each person sets up
+/// their own context before entering the workspace.
+struct PersonalizationView: View {
+    @EnvironmentObject private var model: AvisViewModel
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.06, green: 0.10, blue: 0.21),
+                                    Color(red: 0.04, green: 0.06, blue: 0.13)],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Welcome, \(model.currentUser) 👋")
+                            .font(.system(size: 26, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                        Text("Let's personalize AVIS for you. This is yours alone — every account has its own context, chats, tools, and automations.")
+                            .foregroundStyle(.white.opacity(0.7))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    onboardingCard("What should AVIS call you?", subtitle: "Used to tailor its replies.") {
+                        TextField("Your name or preference", text: $model.contextUser)
+                            .textFieldStyle(.roundedBorder)
+                    }
+
+                    onboardingCard("What are you working on?", subtitle: "Add each project on its own line.") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(model.contextProjects.indices, id: \.self) { index in
+                                HStack(spacing: 8) {
+                                    TextField("Project \(index + 1)", text: $model.contextProjects[index])
+                                        .textFieldStyle(.roundedBorder)
+                                    Button { model.removeProject(at: index) } label: {
+                                        Image(systemName: "minus.circle.fill").foregroundStyle(.secondary)
+                                    }.buttonStyle(.plain)
+                                }
+                            }
+                            Button { model.addProject() } label: {
+                                Label("Add project", systemImage: "plus.circle.fill")
+                            }.buttonStyle(.plain).foregroundStyle(.blue)
+                        }
+                    }
+
+                    onboardingCard("What should AVIS help you with?", subtitle: "One capability per line.") {
+                        TextEditor(text: $model.contextHelpsWith)
+                            .frame(minHeight: 100)
+                            .scrollContentBackground(.hidden)
+                            .padding(8)
+                            .background(Color.white.opacity(0.06))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+
+                    HStack {
+                        Button("Skip for now") {
+                            model.needsPersonalization = false
+                            model.page = .chat
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.white.opacity(0.7))
+                        Spacer()
+                        Button("Save & continue") { model.completePersonalization() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.large)
+                    }
+                    .padding(.top, 4)
+                }
+                .frame(maxWidth: 560)
+                .frame(maxWidth: .infinity)
+                .padding(40)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func onboardingCard<Content: View>(_ title: String, subtitle: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title).font(.headline).foregroundStyle(.white)
+            Text(subtitle).font(.caption).foregroundStyle(.white.opacity(0.6))
+            content()
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.08)))
+    }
+}
+
+// MARK: - Settings (per-account)
+
+struct SettingsPanelView: View {
+    @EnvironmentObject private var model: AvisViewModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                HStack {
+                    Text("Settings").font(.system(size: 24, weight: .semibold))
+                    Spacer()
+                    if model.profileLoading { ProgressView().controlSize(.small) }
+                    Button { model.loadProfile() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                        .buttonStyle(.bordered)
+                }
+                Text("Your account — usage, devices, and personalization. Everything here is scoped to you.")
+                    .foregroundStyle(.secondary)
+
+                accountCard
+                usageCard
+                devicesCard
+                personalizationCard
+                localDataCard
+
+                HStack {
+                    Spacer()
+                    Button(role: .destructive) { model.logout() } label: {
+                        Label("Sign out", systemImage: "rectangle.portrait.and.arrow.right")
+                    }.buttonStyle(.bordered)
+                }
+            }
+            .frame(maxWidth: 780, alignment: .leading)
+            .frame(maxWidth: .infinity)
+            .padding(28)
+        }
+        .onAppear { if model.profile == nil { model.loadProfile() } }
+    }
+
+    // ---- Account identity ----
+    private var accountCard: some View {
+        settingsCard("Account", icon: "person.crop.circle") {
+            HStack(spacing: 14) {
+                Circle()
+                    .fill(LinearGradient(colors: [AccountStyle.color(for: model.currentRole),
+                                                  AccountStyle.color(for: model.currentRole).opacity(0.6)],
+                                         startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 52, height: 52)
+                    .overlay(Text(AccountStyle.initials(model.currentUser))
+                        .font(.system(size: 22, weight: .bold)).foregroundStyle(.white))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(model.currentUser).font(.title3.weight(.semibold))
+                    RoleBadge(role: model.currentRole)
+                }
+                Spacer()
+            }
+            Divider().padding(.vertical, 4)
+            infoRow("Role", model.profile?.role ?? model.currentRole)
+            infoRow("Primary device", model.profile?.primaryDevice ?? "This Mac")
+            infoRow("Member since", model.profile?.created.isEmpty == false ? model.profile!.created : "—")
+            infoRow("Last seen", relativeOrDash(model.profile?.lastSeen))
+        }
+    }
+
+    // ---- Usage ----
+    private var usageCard: some View {
+        settingsCard("Usage", icon: "chart.bar.fill") {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 2), spacing: 12) {
+                statTile("Messages today", model.profile?.usage["messages_today"] ?? 0)
+                statTile("Messages total", model.profile?.usage["messages_total"] ?? 0)
+                statTile("Sign-ins today", model.profile?.usage["logins_today"] ?? 0)
+                statTile("Sign-ins total", model.profile?.usage["logins_total"] ?? 0)
+            }
+        }
+    }
+
+    // ---- Devices ----
+    private var devicesCard: some View {
+        settingsCard("Connected devices", icon: "laptopcomputer.and.iphone") {
+            let devices = model.profile?.devices ?? []
+            if devices.isEmpty {
+                Text("No device activity recorded yet.").foregroundStyle(.secondary).font(.callout)
+            } else {
+                ForEach(devices) { device in
+                    HStack(spacing: 10) {
+                        Image(systemName: device.source == "app" ? "desktopcomputer" : "iphone")
+                            .foregroundStyle(.blue)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(device.label).fontWeight(.medium)
+                            Text("\(device.events) events · \(relativeOrDash(device.lastSeen))")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 6)
+                    if device.id != devices.last?.id { Divider() }
+                }
+            }
+        }
+    }
+
+    // ---- Personalization ----
+    private var personalizationCard: some View {
+        settingsCard("Personalization", icon: "sparkles") {
+            infoRow("Name", model.contextUser.isEmpty ? "—" : model.contextUser)
+            infoRow("Projects", model.contextProjects.isEmpty ? "—" : model.contextProjects.joined(separator: ", "))
+            HStack {
+                Text("Edit these in the Context tab.").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Open Context") { model.page = .context }.buttonStyle(.bordered).controlSize(.small)
+            }
+            .padding(.top, 4)
+        }
+    }
+
+    // ---- Local data ----
+    private var localDataCard: some View {
+        settingsCard("Your data", icon: "internaldrive") {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: 3), spacing: 12) {
+                statTile("Chats", model.savedChats.count)
+                statTile("Tools", model.customTools.count)
+                statTile("Automations", model.automations.count)
+            }
+            Text("Chats, tools, automations, and context are stored privately for your account on this Mac.")
+                .font(.caption).foregroundStyle(.secondary).padding(.top, 4)
+        }
+    }
+
+    // ---- Building blocks ----
+    @ViewBuilder
+    private func settingsCard<Content: View>(_ title: String, icon: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: icon).font(.headline)
+            content()
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).fontWeight(.medium).multilineTextAlignment(.trailing)
+        }
+        .font(.callout)
+    }
+
+    private func statTile(_ label: String, _ value: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("\(value)").font(.system(size: 24, weight: .bold))
+            Text(label).font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.primary.opacity(0.04)))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.08)))
+    }
+
+    private func relativeOrDash(_ ts: Double?) -> String {
+        guard let ts, ts > 0 else { return "—" }
+        let seconds = max(0, Date().timeIntervalSince1970 - ts)
+        if seconds < 60 { return "just now" }
+        if seconds < 3600 { return "\(Int(seconds / 60))m ago" }
+        if seconds < 86400 { return "\(Int(seconds / 3600))h ago" }
+        return "\(Int(seconds / 86400))d ago"
     }
 }
 
@@ -1310,6 +2356,7 @@ struct MainPanel: View {
             case .tools: ToolsPanelView()
             case .automation: AutomationPanelView()
             case .mirror: MirrorPanelView()
+            case .settings: SettingsPanelView()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

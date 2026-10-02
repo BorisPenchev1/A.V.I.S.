@@ -1,0 +1,19 @@
+{
+  "assistant" : "AVIS, a local assistant running on this Mac.",
+  "helps_with" : [
+    "OS checks",
+    "Safe Mac actions",
+    "Local automation",
+    "Voice interaction"
+  ],
+  "user" : "Bobi",
+  "working_on" : [
+    "AVIS",
+    "Physics Fundamentals",
+    "Competitive programming",
+    "Smart Glasses",
+    "HomeLab",
+    "Linear Algebra",
+    "School"
+  ]
+}

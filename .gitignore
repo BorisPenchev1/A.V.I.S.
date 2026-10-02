@@ -4,7 +4,15 @@
 
 # Local runtime and logs
 audit.log
+guard.log
 *.log
+
+# Identity & database: never commit password hashes or the session-signing secret
+security/users.json
+security/server_secret
+avis.db
+avis.db-shm
+avis.db-wal
 
 # Mirror server local config (contains access token) and live feed
 mirror_config.json

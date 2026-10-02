@@ -102,6 +102,21 @@ def main() -> None:
         _emit("err", "No prompt was provided.")
         return
 
+    # Attribute the message to the signed-in user so the admin dashboard's
+    # usage counts reflect real activity from the native app.
+    try:
+        from store import db
+        db.log_event(
+            "message",
+            username=((request.get("user") or "").strip().casefold() or None),
+            role=(request.get("role") or None),
+            device="mac-app",
+            source="app",
+            detail={"chars": len(prompt)},
+        )
+    except Exception:
+        pass
+
     remembered = _handle_remember(prompt)
     if remembered is not None:
         _emit("final", remembered)

@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 from context.avis_context import system_context
 from security.security import execute_tool
+from security.identity import OWNER, Principal
 from main.tools import TOOLS, TOOL_FUNCTIONS, _resolve_allowed_app
 
 
@@ -289,6 +290,7 @@ def _direct_command(
     prompt: str,
     request_permission: Callable[[str, dict[str, Any]], bool] | None,
     state: AssistantState,
+    principal: Principal = OWNER,
 ) -> str | None:
     prompt = _normalize_prompt(prompt)
     patterns = [
@@ -300,7 +302,7 @@ def _direct_command(
         if match:
             try:
                 arguments = {argument_name: match.group(1)}
-                result = execute_tool(tool_name, arguments, TOOL_FUNCTIONS, request_permission)
+                result = execute_tool(tool_name, arguments, TOOL_FUNCTIONS, request_permission, principal)
                 state.record(tool_name, result, arguments)
                 return result
             except (PermissionError, RuntimeError, ValueError, OSError) as error:
@@ -316,7 +318,7 @@ def _direct_command(
     for tool_name, pattern in instant_checks:
         if re.fullmatch(pattern, prompt, re.IGNORECASE):
             try:
-                return _run_direct_tool(tool_name, {}, request_permission, state)
+                return _run_direct_tool(tool_name, {}, request_permission, state, principal)
             except (PermissionError, RuntimeError, ValueError, OSError) as error:
                 return f"Error: {error}"
     if re.fullmatch(
@@ -325,7 +327,7 @@ def _direct_command(
         re.IGNORECASE,
     ):
         try:
-            return _run_direct_tool("get_battery_status", {}, request_permission, state)
+            return _run_direct_tool("get_battery_status", {}, request_permission, state, principal)
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
             return f"Error: {error}"
     bluetooth_battery_match = re.fullmatch(
@@ -340,6 +342,7 @@ def _direct_command(
                 {"name": bluetooth_battery_match.group(1)},
                 request_permission,
                 state,
+                principal,
             )
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
             return f"Error: {error}"
@@ -356,12 +359,13 @@ def _direct_command(
                 {"name": bluetooth_change.group(2)},
                 request_permission,
                 state,
+                principal,
             )
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
             return f"Error: {error}"
     if re.fullmatch(r"\s*(?:pause|play|play/pause|toggle)\s*(?:music|audio|video|media)?\s*[.!]?\s*", prompt, re.IGNORECASE):
         try:
-            return _run_direct_tool("media_play_pause", {}, request_permission, state)
+            return _run_direct_tool("media_play_pause", {}, request_permission, state, principal)
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
             return f"Error: {error}"
     if re.fullmatch(
@@ -370,12 +374,12 @@ def _direct_command(
         re.IGNORECASE,
     ):
         try:
-            return _run_direct_tool("lock_device", {}, request_permission, state)
+            return _run_direct_tool("lock_device", {}, request_permission, state, principal)
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
             return f"Error: {error}"
     if re.fullmatch(r"\s*(?:get|read|show)\s+clipboard\s*[.!]?\s*", prompt, re.IGNORECASE):
         try:
-            result = execute_tool("get_clipboard", {}, TOOL_FUNCTIONS, request_permission)
+            result = execute_tool("get_clipboard", {}, TOOL_FUNCTIONS, request_permission, principal)
             state.record("get_clipboard", result, {})
             return result
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
@@ -397,6 +401,7 @@ def _direct_command(
                 {"date": requested_date},
                 request_permission,
                 state,
+                principal,
             )
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
             return f"Error: {error}"
@@ -408,21 +413,21 @@ def _direct_command(
     if volume_match:
         arguments = {"level": int(volume_match.group(1))}
         try:
-            return _run_direct_tool("set_volume", arguments, request_permission, state)
+            return _run_direct_tool("set_volume", arguments, request_permission, state, principal)
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
             return f"Error: {error}"
     close_match = re.fullmatch(r"\s*close\s+(.+?)\s*[.!]?\s*", prompt, re.IGNORECASE)
     if close_match and _resolve_allowed_app(close_match.group(1)) is not None:
         try:
             arguments = {"name": close_match.group(1)}
-            return _run_direct_tool("close_app", arguments, request_permission, state)
+            return _run_direct_tool("close_app", arguments, request_permission, state, principal)
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
             return f"Error: {error}"
     open_match = re.fullmatch(r"\s*open\s+(.+?)\s*[.!]?\s*", prompt, re.IGNORECASE)
     if open_match and _resolve_allowed_app(open_match.group(1)) is not None:
         try:
             arguments = {"name": open_match.group(1)}
-            return _run_direct_tool("open_app", arguments, request_permission, state)
+            return _run_direct_tool("open_app", arguments, request_permission, state, principal)
         except (PermissionError, RuntimeError, ValueError, OSError) as error:
             return f"Error: {error}"
     return None
@@ -433,8 +438,9 @@ def _run_direct_tool(
     arguments: dict[str, Any],
     request_permission: Callable[[str, dict[str, Any]], bool] | None,
     state: AssistantState,
+    principal: Principal = OWNER,
 ) -> str:
-    result = execute_tool(tool_name, arguments, TOOL_FUNCTIONS, request_permission)
+    result = execute_tool(tool_name, arguments, TOOL_FUNCTIONS, request_permission, principal)
     if not result or not result.strip():
         result = f"{tool_name} completed, but returned no details."
     if tool_name == "run_mac_diagnostics":
@@ -475,6 +481,7 @@ def _execute_tool_call(
     request_permission: Callable[[str, dict[str, Any]], bool] | None,
     memory: ConversationMemory,
     budget: dict[str, int] | None = None,
+    principal: Principal = OWNER,
 ) -> None:
     """Run one Qwen-requested tool call and record its result in memory."""
     function = call.get("function", {})
@@ -505,7 +512,7 @@ def _execute_tool_call(
         memory.add({"role": "tool", "content": f"Tool error: unknown tool {tool_name!r}.", "tool_name": str(tool_name)})
         return
     try:
-        tool_result = execute_tool(tool_name, arguments, TOOL_FUNCTIONS, request_permission)
+        tool_result = execute_tool(tool_name, arguments, TOOL_FUNCTIONS, request_permission, principal)
     except (KeyError, TypeError, ValueError, PermissionError, RuntimeError, OSError) as error:
         tool_result = f"Tool error: {error}"
     tool_result = tool_result or f"{tool_name} completed, but returned no details."
@@ -519,19 +526,23 @@ def run_assistant(
     memory: ConversationMemory | None = None,
     on_token: Callable[[str], None] | None = None,
     force_agent: bool = False,
+    principal: Principal | None = None,
 ) -> str:
     """Run one turn as an agent: chain tools as needed, then compose an answer.
 
     Qwen drives the logic. It may call tools repeatedly; their results are fed
     back to it until it produces a final natural-language answer. Set
     ``force_agent`` to guarantee tool access even for conversational-looking
-    instructions (used by custom tools and automations).
+    instructions (used by custom tools and automations). ``principal`` carries
+    the caller's identity/role/device so the permission policy can act on it;
+    it defaults to the owner on a trusted local device.
     """
     memory = memory or ConversationMemory()
+    principal = principal or OWNER
     mode = _query_mode(prompt)
 
     if not force_agent:
-        direct_result = _direct_command(prompt, request_permission, memory.state)
+        direct_result = _direct_command(prompt, request_permission, memory.state, principal)
         if direct_result is not None:
             memory.add({"role": "user", "content": prompt})
             memory.add({"role": "assistant", "content": direct_result})
@@ -563,7 +574,7 @@ def run_assistant(
             break
         memory.add(message)
         for call in tool_calls:
-            _execute_tool_call(call, request_permission, memory, tool_budget)
+            _execute_tool_call(call, request_permission, memory, tool_budget, principal)
         # Once the fetch allowance is spent, stop looping and synthesize an answer
         # from what was gathered instead of letting the model keep fetching pages.
         if tool_budget["web_fetch"] <= 0:
